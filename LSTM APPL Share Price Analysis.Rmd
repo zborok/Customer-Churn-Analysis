@@ -1,0 +1,2919 @@
+---
+title: "Assignment 4: Neural Nets & Deep Learning"
+author: "Zervaan Borok"
+date: "2/20/2022"
+output: html_document
+---
+
+
+# Part 2 (a)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Libraries
+```{r message=FALSE, warning=FALSE}
+# Core Tidyverse
+library(tidyverse)
+library(ggplot2)
+library(glue)
+library(forcats)
+
+# Time Series
+library(timetk)
+library(tidyquant)
+library(tibbletime)
+
+# Visualization
+library(cowplot)
+
+# Preprocessing
+library(recipes)
+
+# Sampling / Accuracy
+library(rsample)
+library(yardstick) 
+
+# Modeling
+library(keras)
+library(tensorflow)
+set_random_seed(42)
+library(tfruns)
+library(caret)
+library(scales)
+```
+
+
+### Data
+```{r}
+aapl <- read_csv("C:\\Users\\zerva\\Documents\\AM11\\AAPL.csv")
+aapl$Volume[aapl$Volume == 0] <- median(aapl$Volume)
+head(aapl)
+```
+
+
+### Plot 
+```{r}
+ggplot(aapl, aes(x = Date, y = Close, group = 1)) +
+  geom_line(color = "black", alpha = 0.8) +
+  #scale_x_discrete(breaks = levels(aapl$Date)[floor(seq(1, nlevels(aapl$Date),length.out = 5))]) +
+  labs(x = "Date", y = "Close Value", title = "AAPL Stock")
+```
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj <- recipe(Close ~ Close + Date, aapl) %>%
+    step_sqrt(Close) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    prep()
+
+aapl_normalized <- bake(rec_obj, aapl)
+
+#keep centers for denormalization later
+center_history <- rec_obj$steps[[2]]$means["Close"]
+scale_history  <- rec_obj$steps[[3]]$sds["Close"]
+
+c("center" = center_history, "scale" = scale_history)
+```
+
+
+```{r}
+aapl_trn <- aapl_normalized[1:8000,] #training
+aapl_val <- aapl_normalized[8001:9000,] #validation
+aapl_test <- aapl_normalized[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 10 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn <- aapl_trn %>% select(Close) %>% pull() #into  vector
+val <- aapl_val %>% select(Close) %>% pull()
+test <- aapl_test %>% select(Close) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx <- build_windowed_matrix(trn, n_inputs+n_predictions)
+val_mtx <- build_windowed_matrix(val, n_inputs+n_predictions)
+test_mtx <- build_windowed_matrix(test, n_inputs+n_predictions)
+
+X_train <- get_x(trn_mtx, n_inputs, batch_size)
+Y_train <- get_y(trn_mtx, n_inputs, n_predictions, batch_size)
+X_val <- get_x(val_mtx, n_inputs, batch_size)
+Y_val <- get_y(val_mtx, n_inputs, n_predictions, batch_size)
+X_test <- get_x(test_mtx, n_inputs, batch_size)
+Y_test <- get_y(test_mtx, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r message=FALSE, warning=FALSE}
+model <- keras_model_sequential()
+
+model %>%
+  layer_lstm(  #lstm with 32 units in each cell
+    units = 32,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model %>% 
+  layer_dense(units = 1)
+
+model %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history <- model %>% fit(
+  x = X_train,
+  y = Y_train,
+  validation_data = list(X_val, Y_val),
+  batch_size = batch_size,
+  epochs = 100,
+  callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test <- model %>%
+  predict(X_test, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test <- (pred_test * scale_history + center_history)^2 #denormalization
+```
+
+
+```{r fig.width = 14, fig.height = 6}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price")) +
+  geom_line(aes(y = pred_test, color = "Predicted Price")) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+R2(pred_test, aapl$Close[9004:10363])
+```
+
+
+## Using High as well as Close Price
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj_1 <- recipe(Close ~ Close + Date + High, aapl) %>%
+    step_sqrt(Close) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    step_sqrt(High) %>%
+    step_center(High) %>%
+    step_scale(High) %>%
+    prep()
+
+aapl_normalized_1 <- bake(rec_obj_1, aapl)
+
+#keep centers for denormalization later
+center_history_1 <- rec_obj_1$steps[[2]]$means["Close"]
+scale_history_1  <- rec_obj_1$steps[[3]]$sds["Close"]
+
+center_history_11 <- rec_obj_1$steps[[5]]$means["High"]
+scale_history_11  <- rec_obj_1$steps[[6]]$sds["High"]
+
+c("center" = center_history_1, "scale" = scale_history_1 
+  ,"center" = center_history_11, "scale" = scale_history_11
+  )
+```
+
+
+```{r}
+aapl_trn_1 <- aapl_normalized_1[1:8000,] #training
+aapl_val_1 <- aapl_normalized_1[8001:9000,] #validation
+aapl_test_1 <- aapl_normalized_1[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 10 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_1 <- aapl_trn_1 %>% select(Close) %>% pull() #into  vector
+val_1 <- aapl_val_1 %>% select(Close) %>% pull()
+test_1 <- aapl_test_1 %>% select(Close) %>% pull()
+
+trn_11 <- aapl_trn_1 %>% select(High) %>% pull() #into  vector
+val_11 <- aapl_val_1 %>% select(High) %>% pull()
+test_11 <- aapl_test_1 %>% select(High) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_1 <- build_windowed_matrix(trn_1, n_inputs+n_predictions)
+val_mtx_1 <- build_windowed_matrix(val_1, n_inputs+n_predictions)
+test_mtx_1 <- build_windowed_matrix(test_1, n_inputs+n_predictions)
+
+trn_mtx_11 <- build_windowed_matrix(trn_11, n_inputs+n_predictions)
+val_mtx_11 <- build_windowed_matrix(val_11, n_inputs+n_predictions)
+test_mtx_11 <- build_windowed_matrix(test_11, n_inputs+n_predictions)
+
+trn_mtx_111 <- cbind(trn_mtx_1, trn_mtx_11)
+val_mtx_111 <- cbind(val_mtx_1, val_mtx_11)
+test_mtx_111 <- cbind(test_mtx_1, test_mtx_11)
+
+
+X_train_1 <- get_x(trn_mtx_111, n_inputs, batch_size)
+Y_train_1 <- get_y(trn_mtx_111, n_inputs, n_predictions, batch_size)
+X_val_1 <- get_x(val_mtx_111, n_inputs, batch_size)
+Y_val_1 <- get_y(val_mtx_111, n_inputs, n_predictions, batch_size)
+X_test_1 <- get_x(test_mtx_111, n_inputs, batch_size)
+Y_test_1 <- get_y(test_mtx_111, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_1 <- keras_model_sequential()
+
+model_1 %>%
+  layer_lstm(  #lstm with 32 units in each cell
+    units = 32,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_1 %>% 
+  layer_dense(units = 1)
+
+model_1 %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_1 <- model_1 %>% fit(
+  x = X_train_1,
+  y = Y_train_1,
+  validation_data = list(X_val_1, Y_val_1),
+  batch_size = batch_size,
+  epochs = 100,
+  callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_1 <- model_1 %>%
+  predict(X_test_1, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_1 <- (pred_test_1 * scale_history_1 + center_history_1)^2 #denormalization
+```
+
+
+```{r fig.width = 14, fig.height = 6}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test_1)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price")) +
+  geom_line(aes(y = pred_test_1, color = "Predicted Price")) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+R2(pred_test_1, aapl$Close[9004:10363])
+```
+
+
+## Using Low as well as Close Price
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj_2 <- recipe(Close ~ Close + Date + Low, aapl) %>%
+    step_sqrt(Close) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    step_sqrt(Low) %>%
+    step_center(Low) %>%
+    step_scale(Low) %>%
+    prep()
+
+aapl_normalized_2 <- bake(rec_obj_2, aapl)
+
+#keep centers for denormalization later
+center_history_2 <- rec_obj_2$steps[[2]]$means["Close"]
+scale_history_2  <- rec_obj_2$steps[[3]]$sds["Close"]
+
+center_history_22 <- rec_obj_2$steps[[5]]$means["Low"]
+scale_history_22  <- rec_obj_2$steps[[6]]$sds["Low"]
+
+c("center" = center_history_2, "scale" = scale_history_2 
+  ,"center" = center_history_22, "scale" = scale_history_22
+  )
+```
+
+
+```{r}
+aapl_trn_2 <- aapl_normalized_2[1:8000,] #training
+aapl_val_2 <- aapl_normalized_2[8001:9000,] #validation
+aapl_test_2 <- aapl_normalized_2[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 10 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_2 <- aapl_trn_2 %>% select(Close) %>% pull() #into  vector
+val_2 <- aapl_val_2 %>% select(Close) %>% pull()
+test_2 <- aapl_test_2 %>% select(Close) %>% pull()
+
+trn_22 <- aapl_trn_2 %>% select(Low) %>% pull() #into  vector
+val_22 <- aapl_val_2 %>% select(Low) %>% pull()
+test_22 <- aapl_test_2 %>% select(Low) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_2 <- build_windowed_matrix(trn_2, n_inputs+n_predictions)
+val_mtx_2 <- build_windowed_matrix(val_2, n_inputs+n_predictions)
+test_mtx_2 <- build_windowed_matrix(test_2, n_inputs+n_predictions)
+
+trn_mtx_22 <- build_windowed_matrix(trn_22, n_inputs+n_predictions)
+val_mtx_22 <- build_windowed_matrix(val_22, n_inputs+n_predictions)
+test_mtx_22 <- build_windowed_matrix(test_22, n_inputs+n_predictions)
+
+trn_mtx_222 <- cbind(trn_mtx_2, trn_mtx_22)
+val_mtx_222 <- cbind(val_mtx_2, val_mtx_22)
+test_mtx_222 <- cbind(test_mtx_2, test_mtx_22)
+
+X_train_2 <- get_x(trn_mtx_222, n_inputs, batch_size)
+Y_train_2 <- get_y(trn_mtx_222, n_inputs, n_predictions, batch_size)
+X_val_2 <- get_x(val_mtx_222, n_inputs, batch_size)
+Y_val_2 <- get_y(val_mtx_222, n_inputs, n_predictions, batch_size)
+X_test_2 <- get_x(test_mtx_222, n_inputs, batch_size)
+Y_test_2 <- get_y(test_mtx_222, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_2 <- keras_model_sequential()
+
+model_2 %>%
+  layer_lstm(  #lstm with 32 units in each cell
+    units = 32,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_2 %>% 
+  layer_dense(units = 1)
+
+model_2 %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_2 <- model_2 %>% fit(
+  x = X_train_2,
+  y = Y_train_2,
+  validation_data = list(X_val_2, Y_val_2),
+  batch_size = batch_size,
+  epochs = 100,
+  callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_2 <- model_2 %>%
+  predict(X_test_2, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_2 <- (pred_test_2 * scale_history_2 + center_history_2)^2 #denormalization
+```
+
+
+```{r fig.width = 14, fig.height = 6}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test_2)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price")) +
+  geom_line(aes(y = pred_test_2, color = "Predicted Price")) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+R2(pred_test_2, aapl$Close[9004:10363])
+```
+
+
+## Using Volume as well as Close Price
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj_3 <- recipe(Close ~ Close + Date + Volume, aapl) %>%
+    step_log(Close, base = exp(1)) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    step_log(Volume, base = exp(1)) %>%
+    step_center(Volume) %>%
+    step_scale(Volume) %>%
+    prep()
+
+aapl_normalized_3 <- bake(rec_obj_3, aapl)
+
+#keep centers for denormalization later
+center_history_3 <- rec_obj_3$steps[[2]]$means["Close"]
+scale_history_3  <- rec_obj_3$steps[[3]]$sds["Close"]
+
+center_history_33 <- rec_obj_3$steps[[5]]$means["Volume"]
+scale_history_33  <- rec_obj_3$steps[[6]]$sds["Volume"]
+
+c("center" = center_history_3, "scale" = scale_history_3 
+  ,"center" = center_history_33, "scale" = scale_history_33
+  )
+```
+
+
+```{r}
+aapl_trn_3 <- aapl_normalized_3[1:8000,] #training
+aapl_val_3 <- aapl_normalized_3[8001:9000,] #validation
+aapl_test_3 <- aapl_normalized_3[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 10 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_3 <- aapl_trn_3 %>% select(Close) %>% pull() #into  vector
+val_3 <- aapl_val_3 %>% select(Close) %>% pull()
+test_3 <- aapl_test_3 %>% select(Close) %>% pull()
+
+trn_33 <- aapl_trn_3 %>% select(Volume) %>% pull() #into  vector
+val_33 <- aapl_val_3 %>% select(Volume) %>% pull()
+test_33 <- aapl_test_3 %>% select(Volume) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_3 <- build_windowed_matrix(trn_3, n_inputs+n_predictions)
+val_mtx_3 <- build_windowed_matrix(val_3, n_inputs+n_predictions)
+test_mtx_3 <- build_windowed_matrix(test_3, n_inputs+n_predictions)
+
+trn_mtx_33 <- build_windowed_matrix(trn_33, n_inputs+n_predictions)
+val_mtx_33 <- build_windowed_matrix(val_33, n_inputs+n_predictions)
+test_mtx_33 <- build_windowed_matrix(test_33, n_inputs+n_predictions)
+
+trn_mtx_333 <- cbind(trn_mtx_3, trn_mtx_33)
+val_mtx_333 <- cbind(val_mtx_3, val_mtx_33)
+test_mtx_333 <- cbind(test_mtx_3, test_mtx_33)
+
+X_train_3 <- get_x(trn_mtx_333, n_inputs, batch_size)
+Y_train_3 <- get_y(trn_mtx_333, n_inputs, n_predictions, batch_size)
+X_val_3 <- get_x(val_mtx_333, n_inputs, batch_size)
+Y_val_3 <- get_y(val_mtx_333, n_inputs, n_predictions, batch_size)
+X_test_3 <- get_x(test_mtx_333, n_inputs, batch_size)
+Y_test_3 <- get_y(test_mtx_333, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_3 <- keras_model_sequential()
+
+model_3 %>%
+  layer_lstm(  #lstm with 32 units in each cell
+    units = 32,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_3 %>% 
+  layer_dense(units = 1)
+
+model_3 %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_3 <- model_3 %>% fit(
+  x = X_train_3,
+  y = Y_train_3,
+  validation_data = list(X_val_3, Y_val_3),
+  batch_size = batch_size,
+  epochs = 100,
+  callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_3 <- model_3 %>%
+  predict(X_test_3, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_3 <- exp((pred_test_3 * scale_history_3 + center_history_3)) #denormalization
+```
+
+
+```{r fig.width = 14, fig.height = 6}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test_3)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price")) +
+  geom_line(aes(y = pred_test_3, color = "Predicted Price")) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+R2(pred_test_3, aapl$Close[9004:10363])
+```
+
+
+## Using Adj Close as well as Close Price
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+names(aapl)[names(aapl) == "Adj Close"] <- "Adj_Close"
+
+rec_obj_4 <- recipe(Close ~ Close + Date + Adj_Close, aapl) %>%
+    step_sqrt(Close) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    step_sqrt(Adj_Close) %>%
+    step_center(Adj_Close) %>%
+    step_scale(Adj_Close) %>%
+    prep()
+
+aapl_normalized_4 <- bake(rec_obj_4, aapl)
+
+#keep centers for denormalization later
+center_history_4 <- rec_obj_4$steps[[2]]$means["Close"]
+scale_history_4  <- rec_obj_4$steps[[3]]$sds["Close"]
+
+center_history_44 <- rec_obj_4$steps[[5]]$means["Adj_Close"]
+scale_history_44  <- rec_obj_4$steps[[6]]$sds["Adj_Close"]
+
+c("center" = center_history_4, "scale" = scale_history_4 
+  ,"center" = center_history_44, "scale" = scale_history_44
+  )
+```
+
+
+```{r}
+aapl_trn_4 <- aapl_normalized_4[1:8000,] #training
+aapl_val_4 <- aapl_normalized_4[8001:9000,] #validation
+aapl_test_4 <- aapl_normalized_4[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 10 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_4 <- aapl_trn_4 %>% select(Close) %>% pull() #into  vector
+val_4 <- aapl_val_4 %>% select(Close) %>% pull()
+test_4 <- aapl_test_4 %>% select(Close) %>% pull()
+
+trn_44 <- aapl_trn_4 %>% select(Adj_Close) %>% pull() #into  vector
+val_44 <- aapl_val_4 %>% select(Adj_Close) %>% pull()
+test_44 <- aapl_test_4 %>% select(Adj_Close) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_4 <- build_windowed_matrix(trn_4, n_inputs+n_predictions)
+val_mtx_4 <- build_windowed_matrix(val_4, n_inputs+n_predictions)
+test_mtx_4 <- build_windowed_matrix(test_4, n_inputs+n_predictions)
+
+trn_mtx_44 <- build_windowed_matrix(trn_44, n_inputs+n_predictions)
+val_mtx_44 <- build_windowed_matrix(val_44, n_inputs+n_predictions)
+test_mtx_44 <- build_windowed_matrix(test_44, n_inputs+n_predictions)
+
+trn_mtx_444 <- cbind(trn_mtx_4, trn_mtx_44)
+val_mtx_444 <- cbind(val_mtx_4, val_mtx_44)
+test_mtx_444 <- cbind(test_mtx_4, test_mtx_44)
+
+X_train_4 <- get_x(trn_mtx_444, n_inputs, batch_size)
+Y_train_4 <- get_y(trn_mtx_444, n_inputs, n_predictions, batch_size)
+X_val_4 <- get_x(val_mtx_444, n_inputs, batch_size)
+Y_val_4 <- get_y(val_mtx_444, n_inputs, n_predictions, batch_size)
+X_test_4 <- get_x(test_mtx_444, n_inputs, batch_size)
+Y_test_4 <- get_y(test_mtx_444, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_4 <- keras_model_sequential()
+
+model_4 %>%
+  layer_lstm(  #lstm with 32 units in each cell
+    units = 32,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_4 %>% 
+  layer_dense(units = 1)
+
+model_4 %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_4 <- model_4 %>% fit(
+  x = X_train_4,
+  y = Y_train_4,
+  validation_data = list(X_val_4, Y_val_4),
+  batch_size = batch_size,
+  epochs = 100,
+  callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_4 <- model_4 %>%
+  predict(X_test_4, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_4 <- (pred_test_4 * scale_history_4 + center_history_4)^2 #denormalization
+```
+
+
+```{r fig.width = 14, fig.height = 6}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test_4)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price")) +
+  geom_line(aes(y = pred_test_4, color = "Predicted Price")) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+R2(pred_test_4, aapl$Close[9004:10363])
+```
+
+
+## Using Adj Close, High, Low, Volume, and Open as well as Close Price
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj_5 <- recipe(Close ~ Close + Date + Adj_Close + High + Low + Volume + Open, aapl) %>%
+    step_log(Close, base = exp(1)) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    step_log(Adj_Close, base = exp(1)) %>%
+    step_center(Adj_Close) %>%
+    step_scale(Adj_Close) %>%
+    step_log(High, base = exp(1)) %>%
+    step_center(High) %>%
+    step_scale(High) %>%
+    step_log(Low, base = exp(1)) %>%
+    step_center(Low) %>%
+    step_scale(Low) %>%
+    step_log(Volume, base = exp(1)) %>%
+    step_center(Volume) %>%
+    step_scale(Volume) %>%
+    step_log(Open, base = exp(1)) %>%
+    step_center(Open) %>%
+    step_scale(Open) %>%
+    prep()
+
+aapl_normalized_5 <- bake(rec_obj_5, aapl)
+
+#keep centers for denormalization later
+center_history_5 <- rec_obj_5$steps[[2]]$means["Close"]
+scale_history_5  <- rec_obj_5$steps[[3]]$sds["Close"]
+
+center_history_55 <- rec_obj_5$steps[[5]]$means["Adj_Close"]
+scale_history_55  <- rec_obj_5$steps[[6]]$sds["Adj_Close"]
+
+center_history_555 <- rec_obj_5$steps[[8]]$means["High"]
+scale_history_555  <- rec_obj_5$steps[[9]]$sds["High"]
+
+center_history_5555 <- rec_obj_5$steps[[11]]$means["Low"]
+scale_history_5555  <- rec_obj_5$steps[[12]]$sds["Low"]
+
+center_history_55555 <- rec_obj_5$steps[[14]]$means["Volume"]
+scale_history_55555  <- rec_obj_5$steps[[15]]$sds["Volume"]
+
+center_history_555555 <- rec_obj_5$steps[[17]]$means["Open"]
+scale_history_555555  <- rec_obj_5$steps[[18]]$sds["Open"]
+
+c("center" = center_history_5, "scale" = scale_history_5 
+  ,"center" = center_history_55, "scale" = scale_history_55
+  ,"center" = center_history_555, "scale" = scale_history_555
+  ,"center" = center_history_5555, "scale" = scale_history_5555
+  ,"center" = center_history_55555, "scale" = scale_history_55555
+  ,"center" = center_history_555555, "scale" = scale_history_555555
+  )
+```
+
+
+```{r}
+aapl_trn_5 <- aapl_normalized_5[1:8000,] #training
+aapl_val_5 <- aapl_normalized_5[8001:9000,] #validation
+aapl_test_5 <- aapl_normalized_5[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 10 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_5 <- aapl_trn_5 %>% select(Close) %>% pull() #into  vector
+val_5 <- aapl_val_5 %>% select(Close) %>% pull()
+test_5 <- aapl_test_5 %>% select(Close) %>% pull()
+
+trn_55 <- aapl_trn_5 %>% select(Adj_Close) %>% pull() #into  vector
+val_55 <- aapl_val_5 %>% select(Adj_Close) %>% pull()
+test_55 <- aapl_test_5 %>% select(Adj_Close) %>% pull()
+
+trn_555 <- aapl_trn_5 %>% select(High) %>% pull() #into  vector
+val_555 <- aapl_val_5 %>% select(High) %>% pull()
+test_555 <- aapl_test_5 %>% select(High) %>% pull()
+
+trn_5555 <- aapl_trn_5 %>% select(Low) %>% pull() #into  vector
+val_5555 <- aapl_val_5 %>% select(Low) %>% pull()
+test_5555 <- aapl_test_5 %>% select(Low) %>% pull()
+
+trn_55555 <- aapl_trn_5 %>% select(Volume) %>% pull() #into  vector
+val_55555 <- aapl_val_5 %>% select(Volume) %>% pull()
+test_55555 <- aapl_test_5 %>% select(Volume) %>% pull()
+
+trn_555555 <- aapl_trn_5 %>% select(Open) %>% pull() #into  vector
+val_555555 <- aapl_val_5 %>% select(Open) %>% pull()
+test_555555 <- aapl_test_5 %>% select(Open) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_5 <- build_windowed_matrix(trn_5, n_inputs+n_predictions)
+val_mtx_5 <- build_windowed_matrix(val_5, n_inputs+n_predictions)
+test_mtx_5 <- build_windowed_matrix(test_5, n_inputs+n_predictions)
+
+trn_mtx_55 <- build_windowed_matrix(trn_55, n_inputs+n_predictions)
+val_mtx_55 <- build_windowed_matrix(val_55, n_inputs+n_predictions)
+test_mtx_55 <- build_windowed_matrix(test_55, n_inputs+n_predictions)
+
+trn_mtx_555 <- build_windowed_matrix(trn_555, n_inputs+n_predictions)
+val_mtx_555 <- build_windowed_matrix(val_555, n_inputs+n_predictions)
+test_mtx_555 <- build_windowed_matrix(test_555, n_inputs+n_predictions)
+
+trn_mtx_5555 <- build_windowed_matrix(trn_5555, n_inputs+n_predictions)
+val_mtx_5555 <- build_windowed_matrix(val_5555, n_inputs+n_predictions)
+test_mtx_5555 <- build_windowed_matrix(test_5555, n_inputs+n_predictions)
+
+trn_mtx_55555 <- build_windowed_matrix(trn_55555, n_inputs+n_predictions)
+val_mtx_55555 <- build_windowed_matrix(val_55555, n_inputs+n_predictions)
+test_mtx_55555 <- build_windowed_matrix(test_55555, n_inputs+n_predictions)
+
+trn_mtx_555555 <- build_windowed_matrix(trn_555555, n_inputs+n_predictions)
+val_mtx_555555 <- build_windowed_matrix(val_555555, n_inputs+n_predictions)
+test_mtx_555555 <- build_windowed_matrix(test_555555, n_inputs+n_predictions)
+
+trn_mtx_5555555 <- cbind(trn_mtx_5, trn_mtx_55, trn_mtx_555, trn_mtx_5555, trn_mtx_55555, trn_mtx_555555)  
+val_mtx_5555555 <- cbind(val_mtx_5, val_mtx_55, val_mtx_555, val_mtx_5555, val_mtx_55555, val_mtx_555555)  
+test_mtx_5555555 <- cbind(test_mtx_5, test_mtx_55, test_mtx_555, test_mtx_5555, test_mtx_55555, test_mtx_555555)
+
+X_train_5 <- get_x(trn_mtx_5555555, n_inputs, batch_size)
+Y_train_5 <- get_y(trn_mtx_5555555, n_inputs, n_predictions, batch_size)
+X_val_5 <- get_x(val_mtx_5555555, n_inputs, batch_size)
+Y_val_5 <- get_y(val_mtx_5555555, n_inputs, n_predictions, batch_size)
+X_test_5 <- get_x(test_mtx_5555555, n_inputs, batch_size)
+Y_test_5 <- get_y(test_mtx_5555555, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_5 <- keras_model_sequential()
+
+model_5 %>%
+  layer_lstm(  #lstm with 32 units in each cell
+    units = 32,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_5 %>% 
+  layer_dense(units = 1)
+
+model_5 %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_5 <- model_5 %>% fit(
+  x = X_train_5,
+  y = Y_train_5,
+  validation_data = list(X_val_5, Y_val_5),
+  batch_size = batch_size,
+  epochs = 100
+  ,callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_5 <- model_5 %>%
+  predict(X_test_5, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_5 <- exp((pred_test_5 * scale_history_5 + center_history_5))  #denormalization
+```
+
+
+```{r fig.width = 14, fig.height = 6}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test_5)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price")) +
+  geom_line(aes(y = pred_test_5, color = "Predicted Price")) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+R2(pred_test_5, aapl$Close[9004:10363])
+```
+
+
+```{r}
+comparisons_R2 <- as.data.frame(c(R2(pred_test, aapl$Close[9004:10363]), R2(pred_test_1, aapl$Close[9004:10363]), R2(pred_test_2, aapl$Close[9004:10363]), R2(pred_test_3, aapl$Close[9004:10363]), R2(pred_test_4, aapl$Close[9004:10363]), R2(pred_test_5, aapl$Close[9004:10363])))
+
+comparisons_RMSE <- as.data.frame(c(RMSE(pred_test, aapl$Close[9004:10363]), RMSE(pred_test_1, aapl$Close[9004:10363]), RMSE(pred_test_2, aapl$Close[9004:10363]), RMSE(pred_test_3, aapl$Close[9004:10363]), RMSE(pred_test_4, aapl$Close[9004:10363]), RMSE(pred_test_5, aapl$Close[9004:10363])))
+
+comparisons <- cbind(comparisons_R2, comparisons_RMSE)
+
+comparisons$Model = c("Close Price Only", "Close Price & High", "Close Price & Low", "Close Price & Volume", "Close Price & Adj Close Price", "Close Price, High, Low, Volume, Adj Close Price, Open Price")
+names(comparisons)[names(comparisons) == "c(R2(pred_test, aapl$Close[9004:10363]), R2(pred_test_1, aapl$Close[9004:10363]), R2(pred_test_2, aapl$Close[9004:10363]), R2(pred_test_3, aapl$Close[9004:10363]), R2(pred_test_4, aapl$Close[9004:10363]), R2(pred_test_5, aapl$Close[9004:10363]))"] <- "R_Squared" 
+names(comparisons)[names(comparisons) == "c(RMSE(pred_test, aapl$Close[9004:10363]), RMSE(pred_test_1, aapl$Close[9004:10363]), RMSE(pred_test_2, aapl$Close[9004:10363]), RMSE(pred_test_3, aapl$Close[9004:10363]), RMSE(pred_test_4, aapl$Close[9004:10363]), RMSE(pred_test_5, aapl$Close[9004:10363]))"] <- "RMSE"
+
+comparisons <- comparisons[, c(3,1,2)]
+comparisons <- comparisons[order(comparisons$R_Squared, -comparisons$RMSE),]
+
+comparisons
+```
+
+
+
+
+# Part 2 (b)
+
+
+## Base Model
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj_6 <- recipe(Close ~ Close + Date, aapl) %>%
+    step_sqrt(Close) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    prep()
+
+aapl_normalized_6 <- bake(rec_obj_6, aapl)
+
+#keep centers for denormalization later
+center_history_6 <- rec_obj_6$steps[[2]]$means["Close"]
+scale_history_6  <- rec_obj_6$steps[[3]]$sds["Close"]
+
+c("center" = center_history_6, "scale" = scale_history_6)
+```
+
+
+```{r}
+aapl_trn_6 <- aapl_normalized_6[1:8000,] #training
+aapl_val_6 <- aapl_normalized_6[8001:9000,] #validation
+aapl_test_6 <- aapl_normalized_6[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 10 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_6 <- aapl_trn_6 %>% select(Close) %>% pull() #into  vector
+val_6 <- aapl_val_6 %>% select(Close) %>% pull()
+test_6 <- aapl_test_6 %>% select(Close) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_6 <- build_windowed_matrix(trn_6, n_inputs+n_predictions)
+val_mtx_6 <- build_windowed_matrix(val_6, n_inputs+n_predictions)
+test_mtx_6 <- build_windowed_matrix(test_6, n_inputs+n_predictions)
+
+X_train_6 <- get_x(trn_mtx_6, n_inputs, batch_size)
+Y_train_6 <- get_y(trn_mtx_6, n_inputs, n_predictions, batch_size)
+X_val_6 <- get_x(val_mtx_6, n_inputs, batch_size)
+Y_val_6 <- get_y(val_mtx_6, n_inputs, n_predictions, batch_size)
+X_test_6 <- get_x(test_mtx_6, n_inputs, batch_size)
+Y_test_6 <- get_y(test_mtx_6, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_6 <- keras_model_sequential()
+
+model_6 %>%
+  layer_simple_rnn(  #rnn with 32 units in each cell
+    units = 32,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_6 %>% 
+  layer_dense(units = 1)
+
+model_6 %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_6 <- model_6 %>% fit(
+  x = X_train_6,
+  y = Y_train_6,
+  validation_data = list(X_val_6, Y_val_6),
+  batch_size = batch_size,
+  epochs = 100,
+  callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_6 <- model_6 %>%
+  predict(X_test_6, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_6 <- (pred_test_6 * scale_history_6 + center_history_6)^2 #denormalization
+```
+
+
+```{r fig.width = 14, fig.height = 6}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test_6)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price")) +
+  geom_line(aes(y = pred_test_6, color = "Predicted Price")) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+R2(pred_test_6, aapl$Close[9004:10363])
+```
+
+
+## Model 1
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj_7 <- recipe(Close ~ Close + Date + Adj_Close + Low, aapl) %>%
+    step_sqrt(Close) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    step_sqrt(Adj_Close) %>%
+    step_center(Adj_Close) %>%
+    step_scale(Adj_Close) %>%
+    step_sqrt(Low) %>%
+    step_center(Low) %>%
+    step_scale(Low) %>%
+    prep()
+
+aapl_normalized_7 <- bake(rec_obj_7, aapl)
+
+#keep centers for denormalization later
+center_history_7 <- rec_obj_7$steps[[2]]$means["Close"]
+scale_history_7  <- rec_obj_7$steps[[3]]$sds["Close"]
+
+center_history_77 <- rec_obj_7$steps[[5]]$means["Adj_Close"]
+scale_history_77  <- rec_obj_7$steps[[6]]$sds["Adj_Close"]
+
+center_history_777 <- rec_obj_7$steps[[8]]$means["Low"]
+scale_history_777  <- rec_obj_7$steps[[9]]$sds["Low"]
+
+c("center" = center_history_7, "scale" = scale_history_7 
+  ,"center" = center_history_77, "scale" = scale_history_77
+  ,"center" = center_history_777, "scale" = scale_history_777
+  )
+```
+
+
+```{r}
+aapl_trn_7 <- aapl_normalized_7[1:8000,] #training
+aapl_val_7 <- aapl_normalized_7[8001:9000,] #validation
+aapl_test_7 <- aapl_normalized_7[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 10 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_7 <- aapl_trn_7 %>% select(Close) %>% pull() #into  vector
+val_7 <- aapl_val_7 %>% select(Close) %>% pull()
+test_7 <- aapl_test_7 %>% select(Close) %>% pull()
+
+trn_77 <- aapl_trn_7 %>% select(Adj_Close) %>% pull() #into  vector
+val_77 <- aapl_val_7 %>% select(Adj_Close) %>% pull()
+test_77 <- aapl_test_7 %>% select(Adj_Close) %>% pull()
+
+trn_777 <- aapl_trn_7 %>% select(Low) %>% pull() #into  vector
+val_777 <- aapl_val_7 %>% select(Low) %>% pull()
+test_777 <- aapl_test_7 %>% select(Low) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_7 <- build_windowed_matrix(trn_7, n_inputs+n_predictions)
+val_mtx_7 <- build_windowed_matrix(val_7, n_inputs+n_predictions)
+test_mtx_7 <- build_windowed_matrix(test_7, n_inputs+n_predictions)
+
+trn_mtx_77 <- build_windowed_matrix(trn_77, n_inputs+n_predictions)
+val_mtx_77 <- build_windowed_matrix(val_77, n_inputs+n_predictions)
+test_mtx_77 <- build_windowed_matrix(test_77, n_inputs+n_predictions)
+
+trn_mtx_777 <- build_windowed_matrix(trn_777, n_inputs+n_predictions)
+val_mtx_777 <- build_windowed_matrix(val_777, n_inputs+n_predictions)
+test_mtx_777 <- build_windowed_matrix(test_777, n_inputs+n_predictions)
+
+trn_mtx_7777 <- cbind(trn_mtx_7, trn_mtx_77, trn_mtx_777)
+val_mtx_7777 <- cbind(val_mtx_7, val_mtx_77, val_mtx_777)
+test_mtx_7777 <- cbind(test_mtx_7, test_mtx_77, test_mtx_777)
+
+X_train_7 <- get_x(trn_mtx_7777, n_inputs, batch_size)
+Y_train_7 <- get_y(trn_mtx_7777, n_inputs, n_predictions, batch_size)
+X_val_7 <- get_x(val_mtx_7777, n_inputs, batch_size)
+Y_val_7 <- get_y(val_mtx_7777, n_inputs, n_predictions, batch_size)
+X_test_7 <- get_x(test_mtx_7777, n_inputs, batch_size)
+Y_test_7 <- get_y(test_mtx_7777, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_7 <- keras_model_sequential()
+
+model_7 %>%
+  layer_simple_rnn(  #rnn with 32 units in each cell
+    units = 32,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_7 %>% 
+  layer_dense(units = 1)
+
+model_7 %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_7 <- model_7 %>% fit(
+  x = X_train_7,
+  y = Y_train_7,
+  validation_data = list(X_val_7, Y_val_7),
+  batch_size = batch_size,
+  epochs = 100,
+  callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_7 <- model_7 %>%
+  predict(X_test_7, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_7 <- (pred_test_7 * scale_history_7 + center_history_7)^2 #denormalization
+```
+
+
+```{r fig.width = 14, fig.height = 6}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test_7)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price")) +
+  geom_line(aes(y = pred_test_7, color = "Predicted Price")) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+R2(pred_test_7, aapl$Close[9004:10363])
+```
+
+
+## Model 2
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj_8 <- recipe(Close ~ Close + Date + Adj_Close + Volume, aapl) %>%
+    step_log(Close, base = exp(1)) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    step_log(Adj_Close, base = exp(1)) %>%
+    step_center(Adj_Close) %>%
+    step_scale(Adj_Close) %>%
+    step_log(Volume, base = exp(1)) %>%
+    step_center(Volume) %>%
+    step_scale(Volume) %>%
+    prep()
+
+aapl_normalized_8 <- bake(rec_obj_8, aapl)
+
+#keep centers for denormalization later
+center_history_8 <- rec_obj_8$steps[[2]]$means["Close"]
+scale_history_8  <- rec_obj_8$steps[[3]]$sds["Close"]
+
+center_history_88 <- rec_obj_8$steps[[5]]$means["Adj_Close"]
+scale_history_88  <- rec_obj_8$steps[[6]]$sds["Adj_Close"]
+
+center_history_888 <- rec_obj_8$steps[[8]]$means["Volume"]
+scale_history_888  <- rec_obj_8$steps[[9]]$sds["Volume"]
+
+c("center" = center_history_8, "scale" = scale_history_8 
+  ,"center" = center_history_88, "scale" = scale_history_88
+  ,"center" = center_history_888, "scale" = scale_history_888
+  )
+```
+
+
+```{r}
+aapl_trn_8 <- aapl_normalized_8[1:8000,] #training
+aapl_val_8 <- aapl_normalized_8[8001:9000,] #validation
+aapl_test_8 <- aapl_normalized_8[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 10 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_8 <- aapl_trn_8 %>% select(Close) %>% pull() #into  vector
+val_8 <- aapl_val_8 %>% select(Close) %>% pull()
+test_8 <- aapl_test_8 %>% select(Close) %>% pull()
+
+trn_88 <- aapl_trn_8 %>% select(Adj_Close) %>% pull() #into  vector
+val_88 <- aapl_val_8 %>% select(Adj_Close) %>% pull()
+test_88 <- aapl_test_8 %>% select(Adj_Close) %>% pull()
+
+trn_888 <- aapl_trn_8 %>% select(Volume) %>% pull() #into  vector
+val_888 <- aapl_val_8 %>% select(Volume) %>% pull()
+test_888 <- aapl_test_8 %>% select(Volume) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_8 <- build_windowed_matrix(trn_8, n_inputs+n_predictions)
+val_mtx_8 <- build_windowed_matrix(val_8, n_inputs+n_predictions)
+test_mtx_8 <- build_windowed_matrix(test_8, n_inputs+n_predictions)
+
+trn_mtx_88 <- build_windowed_matrix(trn_88, n_inputs+n_predictions)
+val_mtx_88 <- build_windowed_matrix(val_88, n_inputs+n_predictions)
+test_mtx_88 <- build_windowed_matrix(test_88, n_inputs+n_predictions)
+
+trn_mtx_888 <- build_windowed_matrix(trn_888, n_inputs+n_predictions)
+val_mtx_888 <- build_windowed_matrix(val_888, n_inputs+n_predictions)
+test_mtx_888 <- build_windowed_matrix(test_888, n_inputs+n_predictions)
+
+trn_mtx_8888 <- cbind(trn_mtx_8, trn_mtx_88, trn_mtx_888)
+val_mtx_8888 <- cbind(val_mtx_8, val_mtx_88, val_mtx_888)
+test_mtx_8888 <- cbind(test_mtx_8, test_mtx_88, test_mtx_888)
+
+X_train_8 <- get_x(trn_mtx_8888, n_inputs, batch_size)
+Y_train_8 <- get_y(trn_mtx_8888, n_inputs, n_predictions, batch_size)
+X_val_8 <- get_x(val_mtx_8888, n_inputs, batch_size)
+Y_val_8 <- get_y(val_mtx_8888, n_inputs, n_predictions, batch_size)
+X_test_8 <- get_x(test_mtx_8888, n_inputs, batch_size)
+Y_test_8 <- get_y(test_mtx_8888, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_8 <- keras_model_sequential()
+
+model_8 %>%
+  layer_simple_rnn(  #rnn with 32 units in each cell
+    units = 32,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_8 %>% 
+  layer_dense(units = 1)
+
+model_8 %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_8 <- model_8 %>% fit(
+  x = X_train_8,
+  y = Y_train_8,
+  validation_data = list(X_val_8, Y_val_8),
+  batch_size = batch_size,
+  epochs = 100,
+  callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_8 <- model_8 %>%
+  predict(X_test_8, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_8 <- exp((pred_test_8 * scale_history_8 + center_history_8)) #denormalization
+```
+
+
+```{r fig.width = 14, fig.height = 6}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test_8)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price")) +
+  geom_line(aes(y = pred_test_8, color = "Predicted Price")) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+R2(pred_test_8, aapl$Close[9004:10363])
+```
+
+
+## Model 3
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj_9 <- recipe(Close ~ Close + Date + Adj_Close + High + Low + Volume + Open, aapl) %>%
+    step_log(Close, base = exp(1)) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    step_log(Adj_Close, base = exp(1)) %>%
+    step_center(Adj_Close) %>%
+    step_scale(Adj_Close) %>%
+    step_log(High, base = exp(1)) %>%
+    step_center(High) %>%
+    step_scale(High) %>%
+    step_log(Low, base = exp(1)) %>%
+    step_center(Low) %>%
+    step_scale(Low) %>%
+    step_log(Volume, base = exp(1)) %>%
+    step_center(Volume) %>%
+    step_scale(Volume) %>%
+    step_log(Open, base = exp(1)) %>%
+    step_center(Open) %>%
+    step_scale(Open) %>%
+    prep()
+
+aapl_normalized_9 <- bake(rec_obj_9, aapl)
+
+#keep centers for denormalization later
+center_history_9 <- rec_obj_9$steps[[2]]$means["Close"]
+scale_history_9  <- rec_obj_9$steps[[3]]$sds["Close"]
+
+center_history_99 <- rec_obj_9$steps[[5]]$means["Adj_Close"]
+scale_history_99  <- rec_obj_9$steps[[6]]$sds["Adj_Close"]
+
+center_history_999 <- rec_obj_9$steps[[8]]$means["High"]
+scale_history_999  <- rec_obj_9$steps[[9]]$sds["High"]
+
+center_history_9999 <- rec_obj_9$steps[[11]]$means["Low"]
+scale_history_9999  <- rec_obj_9$steps[[12]]$sds["Low"]
+
+center_history_99999 <- rec_obj_9$steps[[14]]$means["Volume"]
+scale_history_99999  <- rec_obj_9$steps[[15]]$sds["Volume"]
+
+center_history_999999 <- rec_obj_9$steps[[17]]$means["Open"]
+scale_history_999999  <- rec_obj_9$steps[[18]]$sds["Open"]
+
+c("center" = center_history_9, "scale" = scale_history_9 
+  ,"center" = center_history_99, "scale" = scale_history_99
+  ,"center" = center_history_999, "scale" = scale_history_999
+  ,"center" = center_history_9999, "scale" = scale_history_9999
+  ,"center" = center_history_99999, "scale" = scale_history_99999
+  ,"center" = center_history_999999, "scale" = scale_history_999999
+  )
+```
+
+
+```{r}
+aapl_trn_9 <- aapl_normalized_9[1:8000,] #training
+aapl_val_9 <- aapl_normalized_9[8001:9000,] #validation
+aapl_test_9 <- aapl_normalized_9[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 10 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_9 <- aapl_trn_9 %>% select(Close) %>% pull() #into  vector
+val_9 <- aapl_val_9 %>% select(Close) %>% pull()
+test_9 <- aapl_test_9 %>% select(Close) %>% pull()
+
+trn_99 <- aapl_trn_9 %>% select(Adj_Close) %>% pull() #into  vector
+val_99 <- aapl_val_9 %>% select(Adj_Close) %>% pull()
+test_99 <- aapl_test_9 %>% select(Adj_Close) %>% pull()
+
+trn_999 <- aapl_trn_9 %>% select(High) %>% pull() #into  vector
+val_999 <- aapl_val_9 %>% select(High) %>% pull()
+test_999 <- aapl_test_9 %>% select(High) %>% pull()
+
+trn_9999 <- aapl_trn_9 %>% select(Low) %>% pull() #into  vector
+val_9999 <- aapl_val_9 %>% select(Low) %>% pull()
+test_9999 <- aapl_test_9 %>% select(Low) %>% pull()
+
+trn_99999 <- aapl_trn_9 %>% select(Volume) %>% pull() #into  vector
+val_99999 <- aapl_val_9 %>% select(Volume) %>% pull()
+test_99999 <- aapl_test_9 %>% select(Volume) %>% pull()
+
+trn_999999 <- aapl_trn_9 %>% select(Open) %>% pull() #into  vector
+val_999999 <- aapl_val_9 %>% select(Open) %>% pull()
+test_999999 <- aapl_test_9 %>% select(Open) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_9 <- build_windowed_matrix(trn_9, n_inputs+n_predictions)
+val_mtx_9 <- build_windowed_matrix(val_9, n_inputs+n_predictions)
+test_mtx_9 <- build_windowed_matrix(test_9, n_inputs+n_predictions)
+
+trn_mtx_99 <- build_windowed_matrix(trn_99, n_inputs+n_predictions)
+val_mtx_99 <- build_windowed_matrix(val_99, n_inputs+n_predictions)
+test_mtx_99 <- build_windowed_matrix(test_99, n_inputs+n_predictions)
+
+trn_mtx_999 <- build_windowed_matrix(trn_999, n_inputs+n_predictions)
+val_mtx_999 <- build_windowed_matrix(val_999, n_inputs+n_predictions)
+test_mtx_999 <- build_windowed_matrix(test_999, n_inputs+n_predictions)
+
+trn_mtx_9999 <- build_windowed_matrix(trn_9999, n_inputs+n_predictions)
+val_mtx_9999 <- build_windowed_matrix(val_9999, n_inputs+n_predictions)
+test_mtx_9999 <- build_windowed_matrix(test_9999, n_inputs+n_predictions)
+
+trn_mtx_99999 <- build_windowed_matrix(trn_99999, n_inputs+n_predictions)
+val_mtx_99999 <- build_windowed_matrix(val_99999, n_inputs+n_predictions)
+test_mtx_99999 <- build_windowed_matrix(test_99999, n_inputs+n_predictions)
+
+trn_mtx_999999 <- build_windowed_matrix(trn_999999, n_inputs+n_predictions)
+val_mtx_999999 <- build_windowed_matrix(val_999999, n_inputs+n_predictions)
+test_mtx_999999 <- build_windowed_matrix(test_999999, n_inputs+n_predictions)
+
+trn_mtx_9999999 <- cbind(trn_mtx_9, trn_mtx_99, trn_mtx_999, trn_mtx_9999, trn_mtx_99999, trn_mtx_999999)  
+val_mtx_9999999 <- cbind(val_mtx_9, val_mtx_99, val_mtx_999, val_mtx_9999, val_mtx_99999, val_mtx_999999)  
+test_mtx_9999999 <- cbind(test_mtx_9, test_mtx_99, test_mtx_999, test_mtx_9999, test_mtx_99999, test_mtx_999999)
+
+X_train_9 <- get_x(trn_mtx_9999999, n_inputs, batch_size)
+Y_train_9 <- get_y(trn_mtx_9999999, n_inputs, n_predictions, batch_size)
+X_val_9 <- get_x(val_mtx_9999999, n_inputs, batch_size)
+Y_val_9 <- get_y(val_mtx_9999999, n_inputs, n_predictions, batch_size)
+X_test_9 <- get_x(test_mtx_9999999, n_inputs, batch_size)
+Y_test_9 <- get_y(test_mtx_9999999, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_9 <- keras_model_sequential()
+
+model_9 %>%
+  layer_simple_rnn(  #rnn with 32 units in each cell
+    units = 32,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_9 %>% 
+  layer_dense(units = 1)
+
+model_9 %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_9 <- model_9 %>% fit(
+  x = X_train_9,
+  y = Y_train_9,
+  validation_data = list(X_val_9, Y_val_9),
+  batch_size = batch_size,
+  epochs = 100
+  ,callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_9 <- model_9 %>%
+  predict(X_test_9, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_9 <- exp((pred_test_9 * scale_history_9 + center_history_9))  #denormalization
+```
+
+
+```{r fig.width = 14, fig.height = 6}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test_9)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price")) +
+  geom_line(aes(y = pred_test_9, color = "Predicted Price")) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+R2(pred_test_9, aapl$Close[9004:10363])
+```
+
+
+```{r}
+comparisons_R2_2 <- as.data.frame(c(R2(pred_test_6, aapl$Close[9004:10363]), R2(pred_test_7, aapl$Close[9004:10363]), R2(pred_test_8, aapl$Close[9004:10363]), R2(pred_test_9, aapl$Close[9004:10363])))
+
+comparisons_RMSE_2 <- as.data.frame(c(RMSE(pred_test_6, aapl$Close[9004:10363]), RMSE(pred_test_7, aapl$Close[9004:10363]), RMSE(pred_test_8, aapl$Close[9004:10363]), RMSE(pred_test_9, aapl$Close[9004:10363])))
+
+comparisons_2 <- cbind(comparisons_R2_2, comparisons_RMSE_2)
+
+comparisons_2$Model = c("Close Price Only", "Close Price, Adj Close Price, & Low", "Close Price, Adj Close Price, & Volume", "Close Price, High, Low, Volume, Adj Close Price, Open Price")
+names(comparisons_2)[names(comparisons_2) == "c(R2(pred_test_6, aapl$Close[9004:10363]), R2(pred_test_7, aapl$Close[9004:10363]), R2(pred_test_8, aapl$Close[9004:10363]), R2(pred_test_9, aapl$Close[9004:10363]))"] <- "R_Squared" 
+names(comparisons_2)[names(comparisons_2) == "c(RMSE(pred_test_6, aapl$Close[9004:10363]), RMSE(pred_test_7, aapl$Close[9004:10363]), RMSE(pred_test_8, aapl$Close[9004:10363]), RMSE(pred_test_9, aapl$Close[9004:10363]))"] <- "RMSE"
+
+comparisons_2 <- comparisons_2[, c(3,1,2)]
+comparisons_2 <- comparisons_2[order(comparisons_2$R_Squared, -comparisons_2$RMSE),]
+
+comparisons_2
+```
+
+
+
+
+# Part 2 (c)
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj_c <- recipe(Close ~ Close + Date + Adj_Close + High + Low + Volume + Open, aapl) %>%
+    step_log(Close, base = exp(1)) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    step_log(Adj_Close, base = exp(1)) %>%
+    step_center(Adj_Close) %>%
+    step_scale(Adj_Close) %>%
+    step_log(High, base = exp(1)) %>%
+    step_center(High) %>%
+    step_scale(High) %>%
+    step_log(Low, base = exp(1)) %>%
+    step_center(Low) %>%
+    step_scale(Low) %>%
+    step_log(Volume, base = exp(1)) %>%
+    step_center(Volume) %>%
+    step_scale(Volume) %>%
+    step_log(Open, base = exp(1)) %>%
+    step_center(Open) %>%
+    step_scale(Open) %>%
+    prep()
+
+aapl_normalized_c <- bake(rec_obj_c, aapl)
+
+#keep centers for denormalization later
+center_history_c <- rec_obj_c$steps[[2]]$means["Close"]
+scale_history_c  <- rec_obj_c$steps[[3]]$sds["Close"]
+
+center_history_cc <- rec_obj_c$steps[[5]]$means["Adj_Close"]
+scale_history_cc  <- rec_obj_c$steps[[6]]$sds["Adj_Close"]
+
+center_history_ccc <- rec_obj_c$steps[[8]]$means["High"]
+scale_history_ccc  <- rec_obj_c$steps[[9]]$sds["High"]
+
+center_history_cccc <- rec_obj_c$steps[[11]]$means["Low"]
+scale_history_cccc  <- rec_obj_c$steps[[12]]$sds["Low"]
+
+center_history_ccccc <- rec_obj_c$steps[[14]]$means["Volume"]
+scale_history_ccccc  <- rec_obj_c$steps[[15]]$sds["Volume"]
+
+center_history_cccccc <- rec_obj_c$steps[[17]]$means["Open"]
+scale_history_cccccc  <- rec_obj_c$steps[[18]]$sds["Open"]
+
+c("center" = center_history_c, "scale" = scale_history_c 
+  ,"center" = center_history_cc, "scale" = scale_history_cc
+  ,"center" = center_history_ccc, "scale" = scale_history_ccc
+  ,"center" = center_history_cccc, "scale" = scale_history_cccc
+  ,"center" = center_history_ccccc, "scale" = scale_history_ccccc
+  ,"center" = center_history_cccccc, "scale" = scale_history_cccccc
+  )
+```
+
+
+```{r}
+aapl_trn_c <- aapl_normalized_c[1:8000,] #training
+aapl_val_c <- aapl_normalized_c[8001:9000,] #validation
+aapl_test_c <- aapl_normalized_c[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 5 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_c <- aapl_trn_c %>% select(Close) %>% pull() #into  vector
+val_c <- aapl_val_c %>% select(Close) %>% pull()
+test_c <- aapl_test_c %>% select(Close) %>% pull()
+
+trn_cc <- aapl_trn_c %>% select(Adj_Close) %>% pull() #into  vector
+val_cc <- aapl_val_c %>% select(Adj_Close) %>% pull()
+test_cc <- aapl_test_c %>% select(Adj_Close) %>% pull()
+
+trn_ccc <- aapl_trn_c %>% select(High) %>% pull() #into  vector
+val_ccc <- aapl_val_c %>% select(High) %>% pull()
+test_ccc <- aapl_test_c %>% select(High) %>% pull()
+
+trn_cccc <- aapl_trn_c %>% select(Low) %>% pull() #into  vector
+val_cccc <- aapl_val_c %>% select(Low) %>% pull()
+test_cccc <- aapl_test_c %>% select(Low) %>% pull()
+
+trn_ccccc <- aapl_trn_c %>% select(Volume) %>% pull() #into  vector
+val_ccccc <- aapl_val_c %>% select(Volume) %>% pull()
+test_ccccc <- aapl_test_c %>% select(Volume) %>% pull()
+
+trn_cccccc <- aapl_trn_c %>% select(Open) %>% pull() #into  vector
+val_cccccc <- aapl_val_c %>% select(Open) %>% pull()
+test_cccccc <- aapl_test_c %>% select(Open) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_c <- build_windowed_matrix(trn_c, n_inputs+n_predictions)
+val_mtx_c <- build_windowed_matrix(val_c, n_inputs+n_predictions)
+test_mtx_c <- build_windowed_matrix(test_c, n_inputs+n_predictions)
+
+trn_mtx_cc <- build_windowed_matrix(trn_cc, n_inputs+n_predictions)
+val_mtx_cc <- build_windowed_matrix(val_cc, n_inputs+n_predictions)
+test_mtx_cc <- build_windowed_matrix(test_cc, n_inputs+n_predictions)
+
+trn_mtx_ccc <- build_windowed_matrix(trn_ccc, n_inputs+n_predictions)
+val_mtx_ccc <- build_windowed_matrix(val_ccc, n_inputs+n_predictions)
+test_mtx_ccc <- build_windowed_matrix(test_ccc, n_inputs+n_predictions)
+
+trn_mtx_cccc <- build_windowed_matrix(trn_cccc, n_inputs+n_predictions)
+val_mtx_cccc <- build_windowed_matrix(val_cccc, n_inputs+n_predictions)
+test_mtx_cccc <- build_windowed_matrix(test_cccc, n_inputs+n_predictions)
+
+trn_mtx_ccccc <- build_windowed_matrix(trn_ccccc, n_inputs+n_predictions)
+val_mtx_ccccc <- build_windowed_matrix(val_ccccc, n_inputs+n_predictions)
+test_mtx_ccccc <- build_windowed_matrix(test_ccccc, n_inputs+n_predictions)
+
+trn_mtx_cccccc <- build_windowed_matrix(trn_cccccc, n_inputs+n_predictions)
+val_mtx_cccccc <- build_windowed_matrix(val_cccccc, n_inputs+n_predictions)
+test_mtx_cccccc <- build_windowed_matrix(test_cccccc, n_inputs+n_predictions)
+
+trn_mtx_ccccccc <- cbind(trn_mtx_c, trn_mtx_cc, trn_mtx_ccc, trn_mtx_cccc, trn_mtx_ccccc, trn_mtx_cccccc)  
+val_mtx_ccccccc <- cbind(val_mtx_c, val_mtx_cc, val_mtx_ccc, val_mtx_cccc, val_mtx_ccccc, val_mtx_cccccc)  
+test_mtx_ccccccc <- cbind(test_mtx_c, test_mtx_cc, test_mtx_ccc, test_mtx_cccc, test_mtx_ccccc, test_mtx_cccccc)
+
+X_train_c <- get_x(trn_mtx_ccccccc, n_inputs, batch_size)
+Y_train_c <- get_y(trn_mtx_ccccccc, n_inputs, n_predictions, batch_size)
+X_val_c <- get_x(val_mtx_ccccccc, n_inputs, batch_size)
+Y_val_c <- get_y(val_mtx_ccccccc, n_inputs, n_predictions, batch_size)
+X_test_c <- get_x(test_mtx_ccccccc, n_inputs, batch_size)
+Y_test_c <- get_y(test_mtx_ccccccc, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_c <- keras_model_sequential()
+
+model_c %>%
+  layer_lstm(  #lstm with 32 units in each cell
+    units = 256,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_c %>% 
+  layer_dense(units = 1)
+
+model_c %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_c <- model_c %>% fit(
+  x = X_train_c,
+  y = Y_train_c,
+  validation_data = list(X_val_c, Y_val_c),
+  batch_size = batch_size,
+  epochs = 250
+  #,callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_c <- model_c %>%
+  predict(X_test_c, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_c <- exp((pred_test_c * scale_history_c + center_history_c))  #denormalization
+```
+
+
+```{r fig.width = 16, fig.height = 8}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test_c)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price"), size = 1.25) +
+  geom_line(aes(y = pred_test_c, color = "Predicted Price"), size = 1) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+R2(pred_test_c, aapl$Close[9004:10368])
+```
+
+
+```{r}
+comparisons_R2_3 <- as.data.frame(c(R2(pred_test_5, aapl$Close[9004:10363]), R2(pred_test_c, aapl$Close[9004:10368])))
+
+comparisons_RMSE_3 <- as.data.frame(c(RMSE(pred_test_5, aapl$Close[9004:10363]), RMSE(pred_test_c, aapl$Close[9004:10368])))
+
+comparisons_3 <- cbind(comparisons_R2_3, comparisons_RMSE_3)
+
+comparisons_3$Model = c("Untuned LSTM", "Tuned LSTM")
+names(comparisons_3)[names(comparisons_3) == "c(R2(pred_test_5, aapl$Close[9004:10363]), R2(pred_test_c, aapl$Close[9004:10368]))"] <- "R_Squared" 
+names(comparisons_3)[names(comparisons_3) == "c(RMSE(pred_test_5, aapl$Close[9004:10363]), RMSE(pred_test_c, aapl$Close[9004:10368]))"] <- "RMSE"
+
+comparisons_3 <- comparisons_3[, c(3,1,2)]
+
+comparisons_3
+```
+
+
+
+
+# Part 2 (d)
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj_d <- recipe(Close ~ Close + Date + Adj_Close + High + Low + Volume + Open, aapl) %>%
+    step_log(Close, base = exp(1)) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    step_log(Adj_Close, base = exp(1)) %>%
+    step_center(Adj_Close) %>%
+    step_scale(Adj_Close) %>%
+    step_log(High, base = exp(1)) %>%
+    step_center(High) %>%
+    step_scale(High) %>%
+    step_log(Low, base = exp(1)) %>%
+    step_center(Low) %>%
+    step_scale(Low) %>%
+    step_log(Volume, base = exp(1)) %>%
+    step_center(Volume) %>%
+    step_scale(Volume) %>%
+    step_log(Open, base = exp(1)) %>%
+    step_center(Open) %>%
+    step_scale(Open) %>%
+    prep()
+
+aapl_normalized_d <- bake(rec_obj_d, aapl)
+
+#keep centers for denormalization later
+center_history_d <- rec_obj_d$steps[[2]]$means["Close"]
+scale_history_d  <- rec_obj_d$steps[[3]]$sds["Close"]
+
+center_history_dd <- rec_obj_d$steps[[5]]$means["Adj_Close"]
+scale_history_dd  <- rec_obj_d$steps[[6]]$sds["Adj_Close"]
+
+center_history_ddd <- rec_obj_d$steps[[8]]$means["High"]
+scale_history_ddd  <- rec_obj_d$steps[[9]]$sds["High"]
+
+center_history_dddd <- rec_obj_d$steps[[11]]$means["Low"]
+scale_history_dddd  <- rec_obj_d$steps[[12]]$sds["Low"]
+
+center_history_ddddd <- rec_obj_d$steps[[14]]$means["Volume"]
+scale_history_ddddd  <- rec_obj_d$steps[[15]]$sds["Volume"]
+
+center_history_dddddd <- rec_obj_d$steps[[17]]$means["Open"]
+scale_history_dddddd  <- rec_obj_d$steps[[18]]$sds["Open"]
+
+c("center" = center_history_d, "scale" = scale_history_d 
+  ,"center" = center_history_dd, "scale" = scale_history_dd
+  ,"center" = center_history_ddd, "scale" = scale_history_ddd
+  ,"center" = center_history_dddd, "scale" = scale_history_dddd
+  ,"center" = center_history_ddddd, "scale" = scale_history_ddddd
+  ,"center" = center_history_dddddd, "scale" = scale_history_dddddd
+  )
+```
+
+
+```{r}
+aapl_trn_d <- aapl_normalized_d[1:8000,] #training
+aapl_val_d <- aapl_normalized_d[8001:9000,] #validation
+aapl_test_d <- aapl_normalized_d[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 3 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 1
+batch_size <- 5 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_d <- aapl_trn_d %>% select(Close) %>% pull() #into  vector
+val_d <- aapl_val_d %>% select(Close) %>% pull()
+test_d <- aapl_test_d %>% select(Close) %>% pull()
+
+trn_dd <- aapl_trn_d %>% select(Adj_Close) %>% pull() #into  vector
+val_dd <- aapl_val_d %>% select(Adj_Close) %>% pull()
+test_dd <- aapl_test_d %>% select(Adj_Close) %>% pull()
+
+trn_ddd <- aapl_trn_d %>% select(High) %>% pull() #into  vector
+val_ddd <- aapl_val_d %>% select(High) %>% pull()
+test_ddd <- aapl_test_d %>% select(High) %>% pull()
+
+trn_dddd <- aapl_trn_d %>% select(Low) %>% pull() #into  vector
+val_dddd <- aapl_val_d %>% select(Low) %>% pull()
+test_dddd <- aapl_test_d %>% select(Low) %>% pull()
+
+trn_ddddd <- aapl_trn_d %>% select(Volume) %>% pull() #into  vector
+val_ddddd <- aapl_val_d %>% select(Volume) %>% pull()
+test_ddddd <- aapl_test_d %>% select(Volume) %>% pull()
+
+trn_dddddd <- aapl_trn_d %>% select(Open) %>% pull() #into  vector
+val_dddddd <- aapl_val_d %>% select(Open) %>% pull()
+test_dddddd <- aapl_test_d %>% select(Open) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_d <- build_windowed_matrix(trn_d, n_inputs+n_predictions)
+val_mtx_d <- build_windowed_matrix(val_d, n_inputs+n_predictions)
+test_mtx_d <- build_windowed_matrix(test_d, n_inputs+n_predictions)
+
+trn_mtx_dd <- build_windowed_matrix(trn_dd, n_inputs+n_predictions)
+val_mtx_dd <- build_windowed_matrix(val_dd, n_inputs+n_predictions)
+test_mtx_dd <- build_windowed_matrix(test_dd, n_inputs+n_predictions)
+
+trn_mtx_ddd <- build_windowed_matrix(trn_ddd, n_inputs+n_predictions)
+val_mtx_ddd <- build_windowed_matrix(val_ddd, n_inputs+n_predictions)
+test_mtx_ddd <- build_windowed_matrix(test_ddd, n_inputs+n_predictions)
+
+trn_mtx_dddd <- build_windowed_matrix(trn_dddd, n_inputs+n_predictions)
+val_mtx_dddd <- build_windowed_matrix(val_dddd, n_inputs+n_predictions)
+test_mtx_dddd <- build_windowed_matrix(test_dddd, n_inputs+n_predictions)
+
+trn_mtx_ddddd <- build_windowed_matrix(trn_ddddd, n_inputs+n_predictions)
+val_mtx_ddddd <- build_windowed_matrix(val_ddddd, n_inputs+n_predictions)
+test_mtx_ddddd <- build_windowed_matrix(test_ddddd, n_inputs+n_predictions)
+
+trn_mtx_dddddd <- build_windowed_matrix(trn_dddddd, n_inputs+n_predictions)
+val_mtx_dddddd <- build_windowed_matrix(val_dddddd, n_inputs+n_predictions)
+test_mtx_dddddd <- build_windowed_matrix(test_dddddd, n_inputs+n_predictions)
+
+trn_mtx_ddddddd <- cbind(trn_mtx_d, trn_mtx_dd, trn_mtx_ddd, trn_mtx_dddd, trn_mtx_ddddd, trn_mtx_dddddd)  
+val_mtx_ddddddd <- cbind(val_mtx_d, val_mtx_dd, val_mtx_ddd, val_mtx_dddd, val_mtx_ddddd, val_mtx_dddddd)  
+test_mtx_ddddddd <- cbind(test_mtx_d, test_mtx_dd, test_mtx_ddd, test_mtx_dddd, test_mtx_ddddd, test_mtx_dddddd)
+
+X_train_d <- get_x(trn_mtx_ddddddd, n_inputs, batch_size)
+Y_train_d <- get_y(trn_mtx_ddddddd, n_inputs, n_predictions, batch_size)
+X_val_d <- get_x(val_mtx_ddddddd, n_inputs, batch_size)
+Y_val_d <- get_y(val_mtx_ddddddd, n_inputs, n_predictions, batch_size)
+X_test_d <- get_x(test_mtx_ddddddd, n_inputs, batch_size)
+Y_test_d <- get_y(test_mtx_ddddddd, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_d <- keras_model_sequential()
+
+model_d %>%
+  layer_simple_rnn(  #rnn with 32 units in each cell
+    units = 256,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_d %>% 
+  layer_dense(units = 1)
+
+model_d %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_d <- model_d %>% fit(
+  x = X_train_d,
+  y = Y_train_d,
+  validation_data = list(X_val_d, Y_val_d),
+  batch_size = batch_size,
+  epochs = 250
+  #,callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_d <- model_d %>%
+  predict(X_test_d, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_d <- exp((pred_test_d * scale_history_d + center_history_d))  #denormalization
+```
+
+
+```{r fig.width = 16, fig.height = 8}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+dim(pred_test_d)[1]),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price"), size = 1.25) +
+  geom_line(aes(y = pred_test_d, color = "Predicted Price"), size = 1) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190))
+```
+
+
+```{r}
+R2(pred_test_d, aapl$Close[9004:10368])
+```
+
+
+```{r}
+comparisons_R2_4 <- as.data.frame(c(R2(pred_test_9, aapl$Close[9004:10363]), R2(pred_test_d, aapl$Close[9004:10368])))
+
+comparisons_RMSE_4 <- as.data.frame(c(RMSE(pred_test_9, aapl$Close[9004:10363]), RMSE(pred_test_d, aapl$Close[9004:10368])))
+
+comparisons_4 <- cbind(comparisons_R2_4, comparisons_RMSE_4)
+
+comparisons_4$Model = c("Untuned RNN", "Tuned RNN")
+names(comparisons_4)[names(comparisons_4) == "c(R2(pred_test_9, aapl$Close[9004:10363]), R2(pred_test_d, aapl$Close[9004:10368]))"] <- "R_Squared" 
+names(comparisons_4)[names(comparisons_4) == "c(RMSE(pred_test_9, aapl$Close[9004:10363]), RMSE(pred_test_d, aapl$Close[9004:10368]))"] <- "RMSE"
+
+comparisons_4 <- comparisons_4[, c(3,1,2)]
+
+comparisons_4
+```
+
+
+
+
+# PART 2 (e)
+
+
+### Normalize the Data 
+Better performance for LSTM 
+```{r}
+rec_obj_e <- recipe(Close ~ Close + Date + Adj_Close + High + Low + Volume + Open, aapl) %>%
+    step_log(Close, base = exp(1)) %>%
+    step_center(Close) %>%
+    step_scale(Close) %>%
+    step_log(Adj_Close, base = exp(1)) %>%
+    step_center(Adj_Close) %>%
+    step_scale(Adj_Close) %>%
+    step_log(High, base = exp(1)) %>%
+    step_center(High) %>%
+    step_scale(High) %>%
+    step_log(Low, base = exp(1)) %>%
+    step_center(Low) %>%
+    step_scale(Low) %>%
+    step_log(Volume, base = exp(1)) %>%
+    step_center(Volume) %>%
+    step_scale(Volume) %>%
+    step_log(Open, base = exp(1)) %>%
+    step_center(Open) %>%
+    step_scale(Open) %>%
+    prep()
+
+aapl_normalized_e <- bake(rec_obj_e, aapl)
+
+#keep centers for denormalization later
+center_history_e <- rec_obj_e$steps[[2]]$means["Close"]
+scale_history_e  <- rec_obj_e$steps[[3]]$sds["Close"]
+
+center_history_ee <- rec_obj_e$steps[[5]]$means["Adj_Close"]
+scale_history_ee  <- rec_obj_e$steps[[6]]$sds["Adj_Close"]
+
+center_history_eee <- rec_obj_e$steps[[8]]$means["High"]
+scale_history_eee  <- rec_obj_e$steps[[9]]$sds["High"]
+
+center_history_eeee <- rec_obj_e$steps[[11]]$means["Low"]
+scale_history_eeee  <- rec_obj_e$steps[[12]]$sds["Low"]
+
+center_history_eeeee <- rec_obj_e$steps[[14]]$means["Volume"]
+scale_history_eeeee  <- rec_obj_e$steps[[15]]$sds["Volume"]
+
+center_history_eeeeee <- rec_obj_e$steps[[17]]$means["Open"]
+scale_history_eeeeee  <- rec_obj_e$steps[[18]]$sds["Open"]
+
+c("center" = center_history_e, "scale" = scale_history_e 
+  ,"center" = center_history_ee, "scale" = scale_history_ee
+  ,"center" = center_history_eee, "scale" = scale_history_eee
+  ,"center" = center_history_eeee, "scale" = scale_history_eeee
+  ,"center" = center_history_eeeee, "scale" = scale_history_eeeee
+  ,"center" = center_history_eeeeee, "scale" = scale_history_eeeeee
+  )
+```
+
+
+```{r}
+aapl_trn_e <- aapl_normalized_e[1:8000,] #training
+aapl_val_e <- aapl_normalized_e[8001:9000,] #validation
+aapl_test_e <- aapl_normalized_e[9001:10372,] #test for deletion
+```
+
+
+### Reshaping the Data
+```{r}
+n_inputs <- 7 #number of inputs in the RNN e.g. 1st it. use first 10 days to predict the 11th
+n_predictions <- 2
+batch_size <- 10 #number of batches that you give. large the model is faster -- parmeter
+```
+
+
+### Functions
+```{r}
+build_windowed_matrix <- function(data, timesteps) { #tranforms data into the  windows of 4+1) if you have 14K rows this produce a matric of 14K x 5
+  t(sapply(1:(length(data) - timesteps + 1), function(x) 
+    data[x:(x + timesteps - 1)]))
+}
+
+reshape_3D <- function(df){ #to do it 14kx5x1 since this is required by keras. If it was multivariate (n) it should be  14kx5xn!!!
+  dim(df) <- c(dim(df)[1], dim(df)[2], 1)
+  df
+}
+
+get_x <- function(mtx, n_inputs, batch_size){#for each row gets the the x's (4 in number) 
+  mtx <- mtx[, 1:n_inputs]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), ]
+  reshape_3D(mtx)
+}
+
+get_y <- function(mtx, n_inputs, n_predictions, batch_size) {#for each row gets the the y (5th element) + put them in 3D
+  mtx <- mtx[, (n_inputs+1):(n_inputs+n_predictions), drop=FALSE]
+  mtx <- mtx[1:(nrow(mtx) %/% batch_size * batch_size), , drop=FALSE]
+  if(n_predictions==1){
+    dim(mtx) <- c(length(mtx)[1], 1)
+  }
+  reshape_3D(mtx)
+}
+```
+
+
+### Extract 'Close' Values 
+Extract close values and disregard dates
+```{r}
+trn_e <- aapl_trn_e %>% select(Close) %>% pull() #into  vector
+val_e <- aapl_val_e %>% select(Close) %>% pull()
+test_e <- aapl_test_e %>% select(Close) %>% pull()
+
+trn_ee <- aapl_trn_e %>% select(Adj_Close) %>% pull() #into  vector
+val_ee <- aapl_val_e %>% select(Adj_Close) %>% pull()
+test_ee <- aapl_test_e %>% select(Adj_Close) %>% pull()
+
+trn_eee <- aapl_trn_e %>% select(High) %>% pull() #into  vector
+val_eee <- aapl_val_e %>% select(High) %>% pull()
+test_eee <- aapl_test_e %>% select(High) %>% pull()
+
+trn_eeee <- aapl_trn_e %>% select(Low) %>% pull() #into  vector
+val_eeee <- aapl_val_e %>% select(Low) %>% pull()
+test_eeee <- aapl_test_e %>% select(Low) %>% pull()
+
+trn_eeeee <- aapl_trn_e %>% select(Volume) %>% pull() #into  vector
+val_eeeee <- aapl_val_e %>% select(Volume) %>% pull()
+test_eeeee <- aapl_test_e %>% select(Volume) %>% pull()
+
+trn_eeeeee <- aapl_trn_e %>% select(Open) %>% pull() #into  vector
+val_eeeeee <- aapl_val_e %>% select(Open) %>% pull()
+test_eeeeee <- aapl_test_e %>% select(Open) %>% pull()
+```
+
+
+### Build matrices
+actually using the functions that I defined above
+```{r}
+trn_mtx_e <- build_windowed_matrix(trn_e, n_inputs+n_predictions)
+val_mtx_e <- build_windowed_matrix(val_e, n_inputs+n_predictions)
+test_mtx_e <- build_windowed_matrix(test_e, n_inputs+n_predictions)
+
+trn_mtx_ee <- build_windowed_matrix(trn_ee, n_inputs+n_predictions)
+val_mtx_ee <- build_windowed_matrix(val_ee, n_inputs+n_predictions)
+test_mtx_ee <- build_windowed_matrix(test_ee, n_inputs+n_predictions)
+
+trn_mtx_eee <- build_windowed_matrix(trn_eee, n_inputs+n_predictions)
+val_mtx_eee <- build_windowed_matrix(val_eee, n_inputs+n_predictions)
+test_mtx_eee <- build_windowed_matrix(test_eee, n_inputs+n_predictions)
+
+trn_mtx_eeee <- build_windowed_matrix(trn_eeee, n_inputs+n_predictions)
+val_mtx_eeee <- build_windowed_matrix(val_eeee, n_inputs+n_predictions)
+test_mtx_eeee <- build_windowed_matrix(test_eeee, n_inputs+n_predictions)
+
+trn_mtx_eeeee <- build_windowed_matrix(trn_eeeee, n_inputs+n_predictions)
+val_mtx_eeeee <- build_windowed_matrix(val_eeeee, n_inputs+n_predictions)
+test_mtx_eeeee <- build_windowed_matrix(test_eeeee, n_inputs+n_predictions)
+
+trn_mtx_eeeeee <- build_windowed_matrix(trn_eeeeee, n_inputs+n_predictions)
+val_mtx_eeeeee <- build_windowed_matrix(val_eeeeee, n_inputs+n_predictions)
+test_mtx_eeeeee <- build_windowed_matrix(test_eeeeee, n_inputs+n_predictions)
+
+trn_mtx_eeeeeee <- cbind(trn_mtx_e, trn_mtx_ee, trn_mtx_eee, trn_mtx_eeee, trn_mtx_eeeee, trn_mtx_eeeeee)  
+val_mtx_eeeeeee <- cbind(val_mtx_e, val_mtx_ee, val_mtx_eee, val_mtx_eeee, val_mtx_eeeee, val_mtx_eeeeee)  
+test_mtx_eeeeeee <- cbind(test_mtx_e, test_mtx_ee, test_mtx_eee, test_mtx_eeee, test_mtx_eeeee, test_mtx_eeeeee)
+
+X_train_e <- get_x(trn_mtx_eeeeeee, n_inputs, batch_size)
+Y_train_e <- get_y(trn_mtx_eeeeeee, n_inputs, n_predictions, batch_size)
+X_val_e <- get_x(val_mtx_eeeeeee, n_inputs, batch_size)
+Y_val_e <- get_y(val_mtx_eeeeeee, n_inputs, n_predictions, batch_size)
+X_test_e <- get_x(test_mtx_eeeeeee, n_inputs, batch_size)
+Y_test_e <- get_y(test_mtx_eeeeeee, n_inputs, n_predictions, batch_size)
+```
+
+
+### Build model
+```{r}
+model_e <- keras_model_sequential()
+
+model_e %>%
+  layer_simple_rnn(  #rnn with 32 units in each cell
+    units = 128,
+    batch_input_shape = c(batch_size, n_inputs, 1)
+  )
+
+model_e %>% 
+  layer_dense(units = 2)
+
+model_e %>%
+  compile(
+    loss = 'mean_squared_error',
+    optimizer = 'sgd',
+    metrics = list("mean_squared_error")
+  )
+```
+
+
+```{r}
+callbacks <- list(#stop criterion depends on if the network is not learning any more...stop the model from training after 5 epochs if there is no learning
+  callback_early_stopping(patience = 5)
+)
+```
+
+
+```{r}
+history_e <- model_e %>% fit(
+  x = X_train_e,
+  y = Y_train_e,
+  validation_data = list(X_val_e, Y_val_e),
+  batch_size = batch_size,
+  epochs = 200
+  #,callbacks = callbacks
+  ,verbose = 0
+)
+```
+
+
+### Predictions
+```{r}
+pred_test_e <- model_e %>%
+  predict(X_test_e, batch_size = batch_size) 
+# de-normalize to original scale
+pred_test_e <- exp((pred_test_e * scale_history_e + center_history_e))  #denormalization
+```
+
+
+```{r fig.width = 16, fig.height = 8}
+ggplot(aapl[(9001+n_inputs):(9000+n_inputs+nrow(pred_test_e)),], aes(x = Date, y = Close, group = 1)) + geom_line(aes(color = "Actual Price")) +
+  geom_line(aes(y = pred_test_e[, 1], color = "Predicted Price 1 Day")) +
+  geom_line(aes(y = pred_test_e[, 2], color = "Predicted Price 2 Day")) +
+  labs(x = "Date", y = "Close Value", colour = "Legend") +
+  ggtitle("AAPL Stock") +
+                        theme(
+                        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 2.5),
+                        axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+                        axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+                        axis.text.x = element_text(size = 11),
+                        axis.text.y = element_text(size = 11),
+                        legend.title = element_text(size = 12, face = "bold"),
+                        legend.text = element_text(size = 10.5),
+                        legend.key.height = unit(1, 'cm'),
+                        legend.key.width = unit(1.5, 'cm'),
+                        legend.position = "right", legend.margin=margin(l = 30)) +
+                        guides(color = guide_legend(override.aes = list(size = 1.5))) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = c(as.Date("08/01/16", "%m/%d/%y"),as.Date("02/01/22", "%m/%d/%y"))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10), limits = c(0.00, 190)) 
+```
+
+
+```{r}
+comparisons_5 <- as.data.frame(c(R2(pred_test_e[,1], aapl$Close[9008:10367]), RMSE(pred_test_e[,1], aapl$Close[9008:10367])))
+
+comparisons_55 <- as.data.frame(c(R2(pred_test_e[,2], aapl$Close[9008:10367]), RMSE(pred_test_e[,2], aapl$Close[9008:10367]))) 
+
+comparisons_5$Metric = c("R Squared", "RMSE")
+names(comparisons_5)[names(comparisons_5) == "c(R2(pred_test_e[, 1], aapl$Close[9008:10367]), RMSE(pred_test_e[, 1], aapl$Close[9008:10367]))"] <- "Value" 
+comparisons_5 <- comparisons_5[, c(2,1)]
+comparisons_5 <- as.data.frame(t(comparisons_5))
+rownames(comparisons_5) <- c()
+comparisons_5 <- comparisons_5[-1,]
+names(comparisons_5)[names(comparisons_5) == "V1"] <- "R Squared"
+names(comparisons_5)[names(comparisons_5) == "V2"] <- "RMSE"
+comparisons_5 <- comparisons_5 %>%
+  add_column(Model = c("Predicted Price 1 Day"))
+comparisons_5 <- comparisons_5[, c(3,1,2)]
+
+
+comparisons_55$Metric = c("R Squared", "RMSE")
+names(comparisons_55)[names(comparisons_55) == "c(R2(pred_test_e[, 2], aapl$Close[9008:10367]), RMSE(pred_test_e[, 2], aapl$Close[9008:10367]))"] <- "Value" 
+comparisons_55 <- comparisons_55[, c(2,1)]
+comparisons_55 <- as.data.frame(t(comparisons_55))
+rownames(comparisons_55) <- c()
+comparisons_55 <- comparisons_55[-1,]
+names(comparisons_55)[names(comparisons_55) == "V1"] <- "R Squared"
+names(comparisons_55)[names(comparisons_55) == "V2"] <- "RMSE"
+comparisons_55 <- comparisons_55 %>%
+  add_column(Model = c("Predicted Price 2 Day"))
+comparisons_55 <- comparisons_55[, c(3,1,2)]
+
+comparisons_555 <- rbind(comparisons_5, comparisons_55)
+
+comparisons_555
+```
